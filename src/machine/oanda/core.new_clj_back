@@ -1,0 +1,538 @@
+(ns machine.oanda.core
+  (:require [clojure.core.async :refer [go go-loop >! <! <!! thread timeout] :as async]
+            [com.stuartsierra.component :as component]
+            [org.httpkit.client :as http]
+            [cheshire.core :as json]
+            [clj-time.core :as dt]
+            [clj-time.coerce :as dtc]
+            [camel-snake-kebab.core :refer [->kebab-case-keyword]]
+            [taoensso.timbre :as timbre]
+            [taoensso.encore :refer [dissoc-in path reset-in! assoc-some round]]
+            [pandect.algo.md5 :refer [md5]]
+            [machine.oanda.util :as util]
+            [machine.db.core :as db]
+            [machine.quotes.core :as quotes]))
+
+
+(defrecord Oanda [id token account-type url settings db])
+
+
+(defn accounts-info [{:keys [id url token]}]
+  (when-let [resp (http/get (path url "v1" "accounts")
+                            {:keepalive 60000
+                             :oauth-token token})]
+    (if (= 200 (:status @resp))
+      (let [result (-> @resp
+                       :body
+                       (json/parse-string ->kebab-case-keyword)
+                       (util/parse util/from-oanda)
+                       :accounts)]
+        (timbre/info "get accounts info sucessful")
+        result)
+      (timbre/error (json/parse-string (:body @resp) ->kebab-case-keyword)))))
+
+
+(defn account-info [{:keys [id url token]}]
+  (when-let [resp (http/get (path url "v1" "accounts" id)
+                            {:keepalive   60000
+                             :oauth-token token})]
+    (if (= 200 (:status @resp))
+      (let [result (-> @resp
+                       :body
+                       (json/parse-string ->kebab-case-keyword)
+                       )]
+        (timbre/info "get account info sucessful")
+        result)
+      (timbre/error (json/parse-string (:body @resp) ->kebab-case-keyword)))))
+
+
+(defn account-name [{:keys [id url token] :as oanda}]
+  (get (account-info oanda) :account-name))
+
+(defn account-currency [{:keys [id url token] :as oanda}]
+  (get (account-info oanda) :account-currency))
+
+(defn margin-available [{:keys [id url token] :as oanda}]
+  (get (account-info oanda) :margin-available))
+
+(defn margin-used [{:keys [id url token] :as oanda}]
+  (get (account-info oanda) :margin-used))
+
+(defn margin-rate [{:keys [id url token] :as oanda}]
+  (get (account-info oanda) :margin-rate))
+
+(defn balance [{:keys [id url token] :as oanda}]
+  (get (account-info oanda) :balance))
+
+(defn balance-history [{:keys [id url token] :as oanda}]
+  (->> (transactions-closed oanda)
+       (sort-by :time)
+       (map :account-balance)
+       (remove nil?)
+       (not-empty)))
+
+(defn highest-equity
+  ([{:keys [id url token] :as oanda} count]
+   (let [balance-history (balance-history oanda)]
+     (cond
+       (empty? balance-history)
+       (balance oanda)
+       :else
+       (apply max (take-last count (drop-last balance-history))))))
+  ([{:keys [id url token] :as oanda}]
+   (highest-equity oanda 5)))
+
+(defn prices-info
+  ([{:keys [id url token] :as oanda}]
+   (let [query (-> {}
+                   (assoc-some :accountId id)
+                   (assoc-some :instruments (instruments-available oanda))
+                   (util/parse util/to-oanda))]
+     (when-let [resp (http/get (path url "v1" "prices")
+                               {:keepalive    60000
+                                :headers      headers
+                                :query-params query})]
+       (if (= 200 (:status @resp))
+         (let [result (-> @resp
+                          :body
+                          (json/parse-string ->kebab-case-keyword)
+                          (util/parse util/from-oanda)
+                          :prices)]
+           (timbre/info "get prices info sucessful")
+           result)
+         (timbre/error (json/parse-string (:body @resp) ->kebab-case-keyword))))))
+  ([{:keys [id url token] :as oanda} instruments]
+   (->> (prices-info oanda)
+        (filterv #((set instruments) (:instrument %))))))
+
+(defn price-info [{:keys [id url token] :as oanda} instrument]
+  (->> (prices-info oanda)
+       (filterv #(= instrument (:instrument %)))
+       (first)))
+
+(defn price-bid [{:keys [id url token] :as oanda} instrument]
+  (:bid (price-info oanda instrument)))
+
+(defn price-ask [{:keys [id url token] :as oanda} instrument]
+  (:ask (price-info oanda instrument)))
+
+(defn price-time [{:keys [id url token] :as oanda} instrument]
+  (:time (price-info oanda instrument)))
+
+(defn open-trades [{:keys [id url token] :as oanda}]
+  (get (account-info oanda) :open-trades))
+
+(defn unrealized-pl [{:keys [id url token] :as oanda}]
+  (get (account-info oanda) :unrealized-pl))
+
+(defn realized-pl [{:keys [id url token] :as oanda}]
+  (get (account-info oanda) :realized-pl))
+
+(defn orders-info
+  ([{:keys [id url token] :as oanda}]
+   (when-let [resp (http/get (path url "v1" "accounts" id "orders")
+                             {:keepalive 60000
+                              :oauth-token token})]
+     (if (= 200 (:status @resp))
+       (let [result (-> @resp
+                        :body
+                        (json/parse-string ->kebab-case-keyword)
+                        (util/parse util/from-oanda)
+                        :orders)]
+         (timbre/info "get orders info sucessful")
+         result)
+       (timbre/error (json/parse-string (:body @resp) ->kebab-case-keyword))))))
+
+(defn order-info [{:keys [id url token] :as oanda} order-id]
+  (when-let [resp (http/get (path url "v1" "accounts" id "orders" order-id)
+                            {:keepalive 60000
+                             :oauth-token token})]
+    (if (= 200 (:status @resp))
+      (let [result (-> @resp
+                       :body
+                       (json/parse-string ->kebab-case-keyword)
+                       (util/parse util/from-oanda))]
+        (timbre/info "get order" order-id "info sucessful")
+        result)
+      (timbre/error (json/parse-string (:body @resp) ->kebab-case-keyword)))))
+
+(defn trades-info
+  ([{:keys [id url token] :as oanda}]
+   (when-let [resp (http/get (path url "v1" "accounts" id "trades")
+                             {:keepalive 60000
+                              :oauth-token token})]
+     (if (= 200 (:status @resp))
+       (let [result (-> @resp
+                        :body
+                        (json/parse-string ->kebab-case-keyword)
+                        (util/parse util/from-oanda)
+                        :trades)]
+         (timbre/info "get trades info sucessful")
+         result)
+       (timbre/error (json/parse-string (:body @resp) ->kebab-case-keyword))))))
+
+(defn trade-info [{:keys [id url token] :as oanda} trade-id]
+  (when-let [resp (http/get (path url "v1" "accounts" id "trades" trade-id)
+                            {:keepalive 60000
+                             :oauth-token token})]
+    (if (= 200 (:status @resp))
+      (let [result (-> @resp
+                       :body
+                       (json/parse-string ->kebab-case-keyword)
+                       (util/parse util/from-oanda))]
+        (timbre/info "get trade" trade-id "info sucessful")
+        result)
+      (timbre/error (json/parse-string (:body @resp) ->kebab-case-keyword)))))
+
+
+(defn instruments-info
+  ([{:keys [id url token] :as oanda}]
+   (let [fields [:instrument :display-name :pip
+                 :max-trade-units :max-trailing-stop
+                 :min-trailing-stop :margin-rate :halted]
+         query (-> {}
+                   (assoc-some :fields fields)
+                   (assoc :accountId id)
+                   (util/parse util/to-oanda))]
+     (when-let [resp (http/get (path url "v1" "instruments")
+                               {:keepalive    60000
+                                :headers      headers
+                                :query-params query})]
+       (if (= 200 (:status @resp))
+         (let [result (-> @resp
+                          :body
+                          (json/parse-string ->kebab-case-keyword)
+                          (util/parse util/from-oanda)
+                          :instruments)]
+           (timbre/info "get instruments info sucessful")
+           result)
+         (timbre/error (json/parse-string (:body @resp) ->kebab-case-keyword))))))
+  ([{:keys [id url token] :as oanda} instruments]
+   (->> (instruments-info oanda)
+        (filterv #((set instruments) (:instrument %))))))
+
+(defn instrument-info [{:keys [id url token] :as oanda} instrument]
+  (first (instruments-info oanda [instrument])))
+
+(defn instrument-display-name [{:keys [id url token] :as oanda} instrument]
+  (get (instrument-info oanda instrument) :display-name))
+
+(defn instrument-pip [{:keys [id url token] :as oanda} instrument]
+  (get (instrument-info oanda instrument) :pip))
+
+(defn instrument-max-trade-units [{:keys [id url token] :as oanda} instrument]
+  (get (instrument-info oanda instrument) :max-trade-units))
+
+(defn instrument-max-trailing-stop [{:keys [id url token] :as oanda} instrument]
+  (get (instrument-info oanda instrument) :max-trailing-stop))
+
+(defn instrument-min-trailing-stop [{:keys [id url token] :as oanda} instrument]
+  (get (instrument-info oanda instrument) :min-trailing-stop))
+
+(defn instrument-margin-rate [{:keys [id url token] :as oanda} instrument]
+  (get (instrument-info oanda instrument) :margin-rate))
+
+(defn instrument-halted? [{:keys [id url token] :as oanda} instrument]
+  (get (instrument-info oanda instrument) :halted))
+
+(defn instrument-exchange-rate [{:keys [id url token] :as oanda} instrument]
+  (let [account-currency (account-currency oanda)
+        quote-currency (second (clojure.string/split (name instrument) #"-"))
+        quote-home (keyword (str (name quote-currency) "-" (name account-currency)))
+        home-quote (keyword (str (name account-currency) "-" (name quote-currency)))
+        quote-home-price (price-bid oanda quote-home)
+        home-quote-price (price-bid oanda home-quote)]
+    (if quote-home-price
+      quote-home-price
+      (/ 1 (or home-quote-price 1)))))
+
+(defn instrument-tick-value [{:keys [id url token] :as oanda} instrument]
+  (* (instrument-exchange-rate oanda instrument)
+     (instrument-pip oanda instrument)))
+
+(defn instrument-pip-value [{:keys [id url token] :as oanda} instrument units]
+  (* (instrument-tick-value oanda instrument) units))
+
+(defn instruments-available [{:keys [id url token] :as oanda}]
+  (mapv :instrument (instruments-info oanda)))
+
+
+(defn quotes-history
+  ([{:keys [id url token] :as oanda} query]
+   (let [query (-> query
+                   (clojure.set/rename-keys {:id :accountId :period :granularity})
+                   (util/parse util/to-oanda))]
+     (when-let [resp (http/get (path url "v1" "candles")
+                               {:keepalive    60000
+                                :headers      headers
+                                :query-params query})]
+       (condp = (:status @resp)
+         200
+         (do
+           (timbre/info "get quotes history sucessful")
+           (as-> @resp $
+                 (:body $)
+                 (json/parse-string $ ->kebab-case-keyword)
+                 (update-in $ [:candles]
+                            (fn [_] (mapv #(-> %
+                                               (select-keys [:open-bid :high-bid :low-bid
+                                                             :close-bid :volume :time
+                                                             :complete])
+                                               (clojure.set/rename-keys
+                                                 {:open-bid :open :high-bid :high
+                                                  :low-bid  :low :close-bid :close
+                                                  :complete :complete?}))
+                                          (:candles $))))
+                 (util/parse $ util/from-oanda)
+                 (clojure.set/rename-keys $ {:granularity :period})
+                 (:candles $)
+                 (filter #(true? (:complete? %)) $)
+                 (map #(dissoc % :complete?) $)
+                 (sort-by :time $)
+                 (reverse $)
+                 (when-not (empty? $)
+                   (quotes/from-rows $))))
+         204
+         (timbre/warn "no content")
+         (timbre/error (json/parse-string (:body @resp) ->kebab-case-keyword))))))
+  ([{:keys [id url token] :as oanda} instrument period count]
+   (let [query {:instrument        instrument
+                :granularity       period
+                :count             count
+                :candleFormat      "bidask"
+                :dailyAlignment    0
+                :weeklyAlignment   "Monday"
+                :alignmentTimezone "UTC"}]
+     (quotes-history oanda query)))
+  ([{:keys [id url token] :as oanda} instrument period start end]
+   (let [query {:instrument        instrument
+                :granularity       period
+                :start             (long (/ (dtc/to-long start) 1000))
+                :end               (long (/ (dtc/to-long end) 1000))
+                :candleFormat      "bidask"
+                :dailyAlignment    0
+                :weeklyAlignment   "Monday"
+                :alignmentTimezone "UTC"}]
+     (quotes-history oanda query))))
+
+
+(defn transactions-history
+  ([{:keys [id url token] :as oanda}]
+   (transactions-history oanda nil))
+  ([{:keys [id url token] :as oanda} count]
+   (let [parse-transactions
+         (fn [transactions]
+           (mapv (fn [trade]
+                   (if (= :trade-close (:type trade))
+                     (let [pip (instrument-pip oanda (:instrument trade))
+                           open-trade (->> transactions
+                                           (filter #(and (= :market-order-create (:type %))
+                                                         (= (:trade-id trade) (:id %))))
+                                           (first))
+                           profit (condp = (:side trade)
+                                    :buy (/ (- (:price open-trade) (:price trade)) pip)
+                                    :sell (/ (- (:price trade) (:price open-trade)) pip)
+                                    nil)]
+                       (assoc trade :pips-profit profit))
+                     trade))
+                 transactions))]
+     (when-let [resp (http/get (path url "v1" "accounts" id "transactions")
+                               {:headers      headers
+                                :query-params (if count
+                                                {:count count}
+                                                {})})]
+       (if (= 200 (:status @resp))
+         (let [result (-> @resp
+                          :body
+                          (json/parse-string ->kebab-case-keyword)
+                          (util/parse util/from-oanda)
+                          :transactions
+                          (->> (mapv #(clojure.set/rename-keys % {:pl :profit})))
+                          (parse-transactions)
+                          ;(add-pips-profit)
+                          )]
+           (timbre/info "get transactions history sucessful")
+           result)
+         (timbre/error (json/parse-string (:body @resp) ->kebab-case-keyword)))))))
+
+
+(defn transactions-closed [{:keys [id url token] :as oanda}]
+  (if-let [transactions (not-empty (transactions-history oanda))]
+    (->> transactions
+         (filter #(= :trade-close (:type %)))
+         (sort-by :time)
+         (vec))
+    []))
+
+(defn profit-history [{:keys [id url token] :as oanda}]
+  (filterv (complement nil?) (map :profit (transactions-closed oanda))))
+
+(defn pips-history [{:keys [id url token] :as oanda}]
+  (filterv (complement nil?) (map :pips-profit (transactions-closed oanda))))
+
+(defn risk-reward [{:keys [id url token] :as oanda}]
+  (let [trades (profit-history oanda)
+        win (Math/abs ^double (reduce + (filter pos? trades)))
+        loss (Math/abs ^double (reduce + (filter neg? trades)))]
+    (if (every? pos? [win loss])
+      (/ loss win)
+      1.0)))
+
+(defn profitability [{:keys [id url token] :as oanda}]
+  (let [trades (profit-history oanda)
+        win-trades (filter pos? trades)]
+    (if (pos? (count win-trades))
+      (/ (count win-trades) (trades count))
+      0.0)))
+
+(defn drawndown
+  ([{:keys [id url token] :as oanda} count]
+   (loop [dd 0.0 max-dd 0.0 history (->> (profit-history oanda)
+                                         (take-last count))]
+     (if-let [profit (first history)]
+       (if (neg? profit)
+         (recur (- dd (Math/abs ^double profit)) max-dd (rest history))
+         (recur 0.0 (Math/min dd max-dd) (rest history)))
+       (Math/abs (Math/min dd max-dd)))))
+  ([{:keys [id url token] :as oanda}]
+   (drawndown oanda 5)))
+
+(defn drawndown-pips
+  ([{:keys [id url token] :as oanda} count]
+   (loop [dd 0.0 max-dd 0.0 history (->> (pips-history oanda)
+                                         (take-last count))]
+     (if-let [pip (first history)]
+       (if (neg? pip)
+         (recur (- dd (Math/abs ^double pip)) max-dd (rest history))
+         (recur 0.0 (Math/min dd max-dd) (rest history)))
+       (Math/abs (Math/min dd max-dd)))))
+  ([{:keys [id url token] :as oanda}]
+   (drawndown-pips oanda 5)))
+
+
+(defn new-order! [{:keys [id url token] :as oanda} query]
+  (when-let [resp (http/post (path url "v1" "accounts" id "orders")
+                             {:headers     headers
+                              :form-params (util/parse query util/to-oanda)})]
+    (if (= 200 (:status @resp))
+      (let [result (-> @resp
+                       :body
+                       (json/parse-string ->kebab-case-keyword)
+                       (util/parse util/from-oanda))]
+        (timbre/info "post new order sucessful")
+        result)
+      (timbre/error (json/parse-string (:body @resp) ->kebab-case-keyword)))))
+
+(defn market-order!
+  ([{:keys [id url token] :as oanda} instrument side units stop-loss take-profit]
+   (let [query {:instrument instrument
+                :units      units
+                :side       side
+                :type       :market
+                :stopLoss   stop-loss
+                :takeProfit take-profit}]
+     (new-order! oanda query)))
+  ([{:keys [id url token] :as oanda} instrument side units]
+   (let [query {:instrument instrument
+                :units      units
+                :side       side
+                :type       :market}]
+     (new-order! oanda query))))
+
+(defn market-buy!
+  ([oanda instrument units stop-loss take-profit]
+   (let [query {:instrument instrument
+                :units      units
+                :side       :buy
+                :type       :market
+                :stopLoss   stop-loss
+                :takeProfit take-profit}]
+     (new-order! oanda query)))
+  ([oanda instrument units]
+   (let [query {:instrument instrument
+                :units      units
+                :side       :buy
+                :type       :market}]
+     (new-order! oanda query))))
+
+(defn market-sell!
+  ([{:keys [id url token] :as oanda} instrument units stop-loss take-profit]
+   (let [query {:instrument instrument
+                :units      units
+                :side       :sell
+                :type       :market
+                :stopLoss   stop-loss
+                :takeProfit take-profit}]
+     (new-order! oanda query)))
+  ([{:keys [id url token] :as oanda} instrument units]
+   (let [query {:instrument instrument
+                :units      units
+                :side       :sell
+                :type       :market}]
+     (new-order! oanda query))))
+
+(defn modify-trade! [{:keys [id url token] :as oanda}
+                     trade-id stop-loss take-profit]
+  (let [{old-sl :stop-loss
+         old-tp :take-profit} (when-not (and stop-loss take-profit)
+                                (trade-info oanda trade-id))
+        params {:stopLoss   (or stop-loss old-sl 0)
+                :takeProfit (or take-profit old-tp 0)}]
+    (when-let [resp (http/patch (path url "v1" "accounts" id "trades" trade-id)
+                                {:headers     headers
+                                 :form-params (util/parse params util/to-oanda)})]
+      (if (= 200 (:status @resp))
+        (let [result (-> @resp
+                         :body
+                         (json/parse-string ->kebab-case-keyword)
+                         (util/parse util/from-oanda))]
+          (timbre/info "patch trade" trade-id "sucessful")
+          result)
+        (timbre/error (json/parse-string (:body @resp) ->kebab-case-keyword))))))
+
+(defn close-trade! [{:keys [id url token] :as oanda} trade-id]
+  (when-let [resp (http/delete (path url "v1" "accounts" id "trades" trade-id)
+                               {:headers headers})]
+    (if (= 200 (:status @resp))
+      (let [result (-> @resp
+                       :body
+                       (json/parse-string ->kebab-case-keyword)
+                       (util/parse util/from-oanda))]
+        (timbre/info "close trade" trade-id "sucessful")
+        result)
+      (timbre/error (json/parse-string (:body @resp) ->kebab-case-keyword)))))
+
+
+(extend-protocol component/Lifecycle
+  Oanda
+  (start [{:keys [id url token settings cache] :as oanda}]
+    (let [headers (get-in settings [:oanda :headers])]
+      (-> oanda
+          (assoc :id (get-in settings [:oanda :id]))
+          (assoc :token (get-in settings [:oanda :token]))
+          (assoc :account-type (keyword (get-in settings [:oanda :type])))
+          (assoc :url (get-in settings
+                              [:oanda :urls (keyword (get-in settings [:oanda :type]))]))
+          (assoc :headers
+                 (into {} (mapv (fn [[k v]]
+                                  [(name k) v])
+                                (assoc headers
+                                  "Authorization" (str "Bearer "
+                                                       (get-in settings [:oanda :token]))))))
+          (assoc :cache (atom {})))))
+  (stop [oanda]
+    (-> oanda
+        (assoc :id nil)
+        (assoc :token nil)
+        (assoc :account-type nil)
+        (assoc :url nil)
+        (assoc :request-timeout nil))))
+
+
+(defn new-oanda
+  ([]
+   (map->Oanda {}))
+  ([id token account-type]
+   (map->Oanda {:id           id
+                :token        token
+                :account-type account-type})))

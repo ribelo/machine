@@ -1,0 +1,36 @@
+{
+  "oanda" : {
+    "urls" : {
+      "sandbox" : "http://api-sandbox.oanda.com",
+      "fxpractice" : "https://api-fxpractice.oanda.com",
+      "fxtrade" : "https://api-fxtrade.oanda.com"
+    },
+    "download-candles" : 4096,
+    "divergence-instruments" : [ {
+      "first-instrument" : "eur-usd",
+      "second-instrument" : "usd-chf",
+      "negative-correlation?" : true
+    } ],
+    "type" : "fxpractice",
+    "analyse-instruments" : [ "eur-usd", "usd-chf", "usd-jpy", "eur-jpy", "us2000-usd", "uk100-gbp", "jp225-usd", "de30-eur" ],
+    "headers" : {
+      "Content-Type" : "application/x-www-form-urlencoded",
+      "X-Accept-Datetime-Format" : "UNIX"
+    },
+    "token" : "64c66f9f7ca902c4644d3fcc3d84cab2-8fd8705a59a167613ae248f5d5b91888",
+    "id" : 1647729,
+    "max-req-count" : 15,
+    "analyse-periods" : [ "m5", "m10", "m15", "h1" ]
+  },
+  "money-management" : {
+    "max-dd" : 0.03,
+    "max-risk" : 0.005,
+    "drawndown-count" : 5
+  },
+  "trade-management" : {
+    "min-margin-level" : 15000,
+    "max-open-trades" : 3,
+    "max-spread" : 5.0,
+    "max-slippage" : 2.0
+  }
+}
